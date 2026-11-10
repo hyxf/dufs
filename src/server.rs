@@ -53,9 +53,9 @@ use xml::escape::escape_str_pcdata;
 pub type Request = hyper::Request<Incoming>;
 pub type Response = hyper::Response<BoxBody<Bytes, anyhow::Error>>;
 
-const INDEX_HTML: &str = include_str!("../assets-new/index.html");
-const INDEX_CSS: &str = include_str!("../assets-new/index.css");
-const INDEX_JS: &str = include_str!("../assets-new/index.js");
+const INDEX_HTML: &str = include_str!("../assets-react/index.html");
+const INDEX_CSS: &str = include_str!("../assets-react/index.css");
+const INDEX_JS: &str = include_str!("../assets-react/index.js");
 const FAVICON_ICO: &[u8] = include_bytes!("../assets-new/favicon.ico");
 const INDEX_NAME: &str = "index.html";
 const BUF_SIZE: usize = 65536;
@@ -1523,7 +1523,16 @@ impl Server {
             user,
             paths,
         };
-        let output = if has_query_flag(query_params, "json") {
+        let output = if crate::api::is_requested(query_params) {
+            res.headers_mut()
+                .typed_insert(ContentType::from(mime_guess::mime::APPLICATION_JSON));
+            if crate::api::is_supported(query_params) {
+                crate::api::encode(&data)?
+            } else {
+                *res.status_mut() = StatusCode::BAD_REQUEST;
+                crate::api::encode_unsupported_version()?
+            }
+        } else if has_query_flag(query_params, "json") {
             res.headers_mut()
                 .typed_insert(ContentType::from(mime_guess::mime::APPLICATION_JSON));
             serde_json::to_string_pretty(&data)?

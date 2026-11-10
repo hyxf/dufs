@@ -1,0 +1,31 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+}
+
+* { box-sizing: border-box; }
+html { min-width: 320px; min-height: 100%; font-family: var(--font-sans); }
+body { min-width: 320px; min-height: 100vh; margin: 0; }
+button, input, textarea { font: inherit; }
+button { cursor: pointer; }
+.toolbar-button { display: inline-flex; min-height: 36px; align-items: center; justify-content: center; gap: 7px; border-radius: 8px; padding: 0 9px; color: #5c635b; font-size: 13px; text-decoration: none; transition: background-color 140ms, color 140ms; }
+.toolbar-button:hover { background: #f0f3f0; color: #20241f; }
+.toolbar-button:focus-visible, .row-action:focus-visible { outline: 2px solid #6489df; outline-offset: 2px; }
+.row-action { display: inline-grid; width: 30px; height: 30px; place-items: center; border-radius: 6px; color: #757d74; }
+.row-action:hover { background: #f0f3f0; color: #20241f; }
+@media (max-width: 720px) {
+  .toolbar-button > span:not(.user-avatar) { display: none; }
+  .toolbar-button { width: 36px; padding: 0; }
+}
+@media (prefers-color-scheme: dark) {
+  body { color: #ecefe9; background: #151715; }
+  #root > div { color: #ecefe9; background: #151715 !important; }
+  #root header, #root section, #root .bg-white { background-color: #1d211e; }
+  #root header, #root section, #root .border-stone-100, #root .border-stone-200 { border-color: #343a33; }
+  #root .bg-stone-50 { background-color: #252a25; }
+  #root .text-stone-800, #root .text-stone-700 { color: #e6e9e2; }
+  #root .text-stone-600, #root .text-stone-500, #root .text-stone-400 { color: #a4aca1; }
+  #root .hover\:bg-stone-50:hover, #root .hover\:bg-stone-100:hover { background-color: #292f29; }
+  #root input, #root textarea { color: #e6e9e2; }
+}
