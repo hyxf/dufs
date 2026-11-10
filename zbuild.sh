@@ -7,7 +7,7 @@ cd "$ROOT_DIR"
 case "${1:-}" in
   dev)
     shift
-    exec cargo run -- -p 5001 -A ~/Public
+    exec cargo run -- -p 5001 -b 0.0.0.0 -A ~/Public
     ;;
   dev2)
     shift
