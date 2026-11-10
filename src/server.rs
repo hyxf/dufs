@@ -973,7 +973,9 @@ impl Server {
             }
             res.headers_mut().insert(
                 "cache-control",
-                HeaderValue::from_static("public, max-age=31536000, immutable"),
+                // These embedded assets use stable URLs, so they must be revalidated
+                // after an upgrade instead of remaining cached for a year.
+                HeaderValue::from_static("no-cache"),
             );
             res.headers_mut().insert(
                 "x-content-type-options",
