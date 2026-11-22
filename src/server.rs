@@ -1,6 +1,6 @@
 #![allow(clippy::too_many_arguments)]
 
-use crate::auth::{www_authenticate, AccessPaths, AccessPerm, EntryAccess};
+use crate::auth::{www_authenticate, AccessControl, AccessPaths, AccessPerm, EntryAccess};
 use crate::error::DufsErrorCode;
 use crate::http_utils::{body_full, IncomingStream, LengthLimitedStream};
 use crate::noscript::{detect_noscript, generate_noscript_html};
@@ -16,9 +16,9 @@ use bytes::Bytes;
 use chrono::{LocalResult, TimeZone, Utc};
 use futures_util::{pin_mut, TryStreamExt};
 use headers::{
-    AcceptRanges, AccessControlAllowCredentials, AccessControlAllowOrigin, CacheControl,
-    ContentLength, ContentType, ETag, HeaderMap, HeaderMapExt, IfMatch, IfModifiedSince,
-    IfNoneMatch, IfRange, IfUnmodifiedSince, LastModified, Range,
+    AcceptRanges, AccessControlAllowOrigin, CacheControl, ContentLength, ContentType, ETag,
+    HeaderMap, HeaderMapExt, IfMatch, IfModifiedSince, IfNoneMatch, IfRange, IfUnmodifiedSince,
+    LastModified, Range,
 };
 use http_body_util::{combinators::BoxBody, BodyExt, StreamBody};
 use hyper::body::Frame;
@@ -275,7 +275,8 @@ impl Server {
 
         let path = path.as_path();
 
-        let (is_miss, is_dir, is_file, size) = match fs::metadata(path).await.ok() {
+        let meta = fs::metadata(path).await.ok();
+        let (is_miss, is_dir, is_file, size) = match &meta {
             Some(meta) => (false, meta.is_dir(), meta.is_file(), meta.len()),
             None => (true, false, false, 0),
         };
@@ -304,8 +305,14 @@ impl Server {
                                     .await?;
                                 return Ok(res);
                             }
-                            self.handle_zip_dir(path, head_only, access_paths, &mut res)
-                                .await?;
+                            self.handle_zip_dir(
+                                path,
+                                head_only,
+                                user.clone(),
+                                access_paths,
+                                &mut res,
+                            )
+                            .await?;
                         } else if allow_search && query_params.contains_key("q") {
                             self.handle_search_dir(
                                 path,
@@ -344,7 +351,7 @@ impl Server {
                             DufsErrorCode::ArchiveDisabled.respond(&mut res);
                             return Ok(res);
                         }
-                        self.handle_zip_dir(path, head_only, access_paths, &mut res)
+                        self.handle_zip_dir(path, head_only, user.clone(), access_paths, &mut res)
                             .await?;
                     } else if allow_search && query_params.contains_key("q") {
                         self.handle_search_dir(
@@ -370,8 +377,14 @@ impl Server {
                     }
                 } else if is_file {
                     if has_query_flag(&query_params, "json") {
-                        self.handle_file_json(path, head_only, &access_paths, &mut res)
-                            .await?;
+                        self.handle_file_json(
+                            path,
+                            head_only,
+                            &access_paths,
+                            user.as_deref(),
+                            &mut res,
+                        )
+                        .await?;
                     } else if has_query_flag(&query_params, "edit") {
                         self.handle_edit_file(
                             path,
@@ -431,7 +444,7 @@ impl Server {
                     DufsErrorCode::UploadDisabled.respond(&mut res);
                 } else if !allow_delete && size > 0 {
                     DufsErrorCode::DeleteDisabled.respond(&mut res);
-                } else {
+                } else if check_preconditions_for_meta(headers, meta.as_ref(), &mut res) {
                     self.handle_upload(path, None, size, req, &mut res).await?;
                 }
             }
@@ -455,6 +468,9 @@ impl Server {
                                 DufsErrorCode::DeleteDisabled.respond(&mut res);
                                 return Ok(res);
                             }
+                            if !check_preconditions_for_meta(headers, meta.as_ref(), &mut res) {
+                                return Ok(res);
+                            }
                             self.handle_upload(path, Some(offset), size, req, &mut res)
                                 .await?;
                         }
@@ -470,7 +486,7 @@ impl Server {
                 } else if !is_miss {
                     if is_dir && Self::has_restricted_descendant(&access_paths) {
                         DufsErrorCode::ReadonlyDescendant.respond(&mut res);
-                    } else {
+                    } else if check_preconditions_for_meta(headers, meta.as_ref(), &mut res) {
                         self.handle_delete(path, is_dir, &mut res).await?
                     }
                 } else {
@@ -487,9 +503,21 @@ impl Server {
                             } else {
                                 access_paths
                             };
-                        self.handle_propfind_dir(path, headers, access_paths, &mut res)
-                            .await?;
+                        if !check_preconditions_for_meta(headers, meta.as_ref(), &mut res) {
+                            return Ok(res);
+                        }
+                        self.handle_propfind_dir(
+                            path,
+                            headers,
+                            user.clone(),
+                            access_paths,
+                            &mut res,
+                        )
+                        .await?;
                     } else if is_file {
+                        if !check_preconditions_for_meta(headers, meta.as_ref(), &mut res) {
+                            return Ok(res);
+                        }
                         self.handle_propfind_file(path, &mut res).await?;
                     } else {
                         status_not_found(&mut res);
@@ -497,7 +525,9 @@ impl Server {
                 }
                 "PROPPATCH" => {
                     if is_file {
-                        self.handle_proppatch(req_path, &mut res).await?;
+                        if check_preconditions_for_meta(headers, meta.as_ref(), &mut res) {
+                            self.handle_proppatch(req_path, &mut res).await?;
+                        }
                     } else {
                         status_not_found(&mut res);
                     }
@@ -507,7 +537,7 @@ impl Server {
                         DufsErrorCode::UploadDisabled.respond(&mut res);
                     } else if !is_miss {
                         DufsErrorCode::AlreadyExists.respond(&mut res);
-                    } else {
+                    } else if check_preconditions_for_meta(headers, meta.as_ref(), &mut res) {
                         self.handle_mkcol(path, &mut res).await?;
                     }
                 }
@@ -516,7 +546,7 @@ impl Server {
                         DufsErrorCode::UploadDisabled.respond(&mut res);
                     } else if is_miss {
                         status_not_found(&mut res);
-                    } else {
+                    } else if check_preconditions_for_meta(headers, meta.as_ref(), &mut res) {
                         self.handle_copy(path, &req, &mut res).await?
                     }
                 }
@@ -529,7 +559,7 @@ impl Server {
                         status_not_found(&mut res);
                     } else if is_dir && Self::has_restricted_descendant(&access_paths) {
                         DufsErrorCode::ReadonlyDescendant.respond(&mut res);
-                    } else {
+                    } else if check_preconditions_for_meta(headers, meta.as_ref(), &mut res) {
                         self.handle_move(path, &req, &mut res).await?
                     }
                 }
@@ -633,7 +663,10 @@ impl Server {
     ) -> Result<()> {
         let mut paths = vec![];
         if !head_only && exist {
-            paths = match self.list_dir(path, path, &access_paths).await {
+            paths = match self
+                .list_dir(path, path, &access_paths, user.as_deref())
+                .await
+            {
                 Ok(paths) => paths,
                 Err(_) => {
                     DufsErrorCode::InternalError.respond(res);
@@ -651,6 +684,7 @@ impl Server {
             access_paths,
             res,
         )
+        .await
     }
 
     async fn handle_search_dir(
@@ -686,19 +720,30 @@ impl Server {
                 hidden,
                 self.args.allow_symlink,
                 self.args.serve_path.clone(),
+                self.args.auth.clone(),
+                user.clone(),
                 move |x| get_file_name(x.path()).to_lowercase().contains(&search),
             ))
             .await?;
 
             for search_path in search_paths.into_iter() {
-                if let Ok(Some(mut item)) = self.to_pathitem(search_path, path.to_path_buf()).await
-                {
-                    let access = access_paths
-                        .entry_access(&item.name, &prefix, Some(&self.args.serve_path))
-                        .await;
-                    self.set_item_access(&mut item, access);
-                    paths.push(item);
-                }
+                let Ok(Some(mut item)) = self.to_pathitem(search_path.as_path(), path).await else {
+                    continue;
+                };
+                let Some(access) = self
+                    .entry_access(
+                        &access_paths,
+                        &search_path,
+                        &item.name,
+                        &prefix,
+                        user.as_deref(),
+                    )
+                    .await
+                else {
+                    continue;
+                };
+                self.set_item_access(&mut item, access);
+                paths.push(item);
             }
         }
         self.send_index(
@@ -711,12 +756,14 @@ impl Server {
             access_paths,
             res,
         )
+        .await
     }
 
     async fn handle_zip_dir(
         &self,
         path: &Path,
         head_only: bool,
+        user: Option<String>,
         access_paths: AccessPaths,
         res: &mut Response,
     ) -> Result<()> {
@@ -734,6 +781,7 @@ impl Server {
         let compression = self.args.compress.to_compression();
         let follow_symlinks = self.args.allow_symlink;
         let serve_path = self.args.serve_path.clone();
+        let auth = self.args.auth.clone();
         tokio::spawn(async move {
             if let Err(e) = zip_dir(
                 &mut writer,
@@ -743,6 +791,8 @@ impl Server {
                 compression,
                 follow_symlinks,
                 serve_path,
+                auth,
+                user,
                 running,
             )
             .await
@@ -782,7 +832,19 @@ impl Server {
             let access = access_paths
                 .entry_access(INDEX_NAME, &prefix, Some(&self.args.serve_path))
                 .await;
-            !access.perm.indexonly() && !self.guard_root_contained(&index_path).await
+            let index_rel = self.relative_parts(&index_path).join("/");
+            !access.perm.indexonly()
+                && !self.guard_root_contained(&index_path).await
+                && self
+                    .args
+                    .auth
+                    .can_access(
+                        user.as_deref(),
+                        &index_rel,
+                        &Method::GET,
+                        &self.args.serve_path,
+                    )
+                    .await
         } else {
             false
         };
@@ -803,6 +865,7 @@ impl Server {
         path: &Path,
         head_only: bool,
         access_paths: &AccessPaths,
+        user: Option<&str>,
         res: &mut Response,
     ) -> Result<()> {
         let mut pathitem = match self.to_pathitem(path, &self.args.serve_path).await? {
@@ -812,10 +875,15 @@ impl Server {
                 return Ok(());
             }
         };
+        let readwrite = access_paths.perm().readwrite() && self.path_readwrite(path, user).await;
         self.set_item_access(
             &mut pathitem,
             EntryAccess {
-                perm: access_paths.perm(),
+                perm: if readwrite {
+                    access_paths.perm()
+                } else {
+                    AccessPerm::ReadOnly
+                },
                 restricted: false,
             },
         );
@@ -1006,32 +1074,11 @@ impl Server {
         let (mut file, meta) = (file?, meta?);
         let size = meta.len();
         let mut use_range = true;
-        if let Some((etag, last_modified)) = extract_cache_headers(&meta) {
-            if let Some(if_unmodified_since) = headers.typed_get::<IfUnmodifiedSince>() {
-                if !if_unmodified_since.precondition_passes(last_modified.into()) {
-                    DufsErrorCode::PreconditionFailed.respond(res);
-                    return Ok(());
-                }
-            }
-            if let Some(if_match) = headers.typed_get::<IfMatch>() {
-                if !if_match.precondition_passes(&etag) {
-                    DufsErrorCode::PreconditionFailed.respond(res);
-                    return Ok(());
-                }
-            }
-            if let Some(if_modified_since) = headers.typed_get::<IfModifiedSince>() {
-                if !if_modified_since.is_modified(last_modified.into()) {
-                    *res.status_mut() = StatusCode::NOT_MODIFIED;
-                    return Ok(());
-                }
-            }
-            if let Some(if_none_match) = headers.typed_get::<IfNoneMatch>() {
-                if !if_none_match.precondition_passes(&etag) {
-                    *res.status_mut() = StatusCode::NOT_MODIFIED;
-                    return Ok(());
-                }
-            }
-
+        let cache_headers = extract_cache_headers(&meta);
+        if !check_preconditions(headers, cache_headers.as_ref(), true, res) {
+            return Ok(());
+        }
+        if let Some((etag, last_modified)) = cache_headers {
             res.headers_mut()
                 .typed_insert(CacheControl::new().with_no_cache());
             res.headers_mut().typed_insert(last_modified);
@@ -1048,7 +1095,11 @@ impl Server {
             }
         }
 
-        let ranges = if use_range {
+        // RFC 9110 §14.2: a server MAY ignore Range when the selected
+        // representation has no content. A zero-length representation has no
+        // non-empty byte range to serve and a 206 response cannot express an
+        // empty one, so ignore Range and fall through to a 200 response.
+        let ranges = if use_range && size != 0 {
             headers.get(RANGE).map(|range| {
                 range
                     .to_str()
@@ -1193,7 +1244,8 @@ impl Server {
         file.take(1024).read_to_end(&mut buffer).await?;
         let editable =
             meta.len() <= EDITABLE_TEXT_MAX_SIZE && content_inspector::inspect(&buffer).is_text();
-        let readwrite = access_paths.perm().readwrite();
+        let readwrite =
+            access_paths.perm().readwrite() && self.path_readwrite(path, user.as_deref()).await;
         let data = EditData {
             href,
             kind,
@@ -1267,6 +1319,7 @@ impl Server {
         &self,
         path: &Path,
         headers: &HeaderMap<HeaderValue>,
+        user: Option<String>,
         access_paths: AccessPaths,
         res: &mut Response,
     ) -> Result<()> {
@@ -1301,7 +1354,7 @@ impl Server {
         };
         if depth == 1 {
             match self
-                .list_dir(path, &self.args.serve_path, &access_paths)
+                .list_dir(path, &self.args.serve_path, &access_paths, user.as_deref())
                 .await
             {
                 Ok(child) => paths.extend(child),
@@ -1388,6 +1441,24 @@ impl Server {
             }
         };
 
+        // A relative symlink resolves against its own parent directory, so moving
+        // it to a different parent changes what it points at without changing the
+        // request path. The target check below would catch the new target, but
+        // refusing the move as well closes the race between that check and the
+        // following filesystem operation. Renaming within the same parent
+        // preserves every relative target, so only the target permission check
+        // applies to it.
+        if self.args.auth.has_rules()
+            && path.parent() != dest.parent()
+            && contains_symlink(path).await
+        {
+            DufsErrorCode::Forbidden.respond_with(
+                res,
+                "Forbidden: cannot move symlinks when access rules are enabled",
+            );
+            return Ok(());
+        }
+
         if self.guard_root_contained(&dest).await {
             DufsErrorCode::InvalidDestination.respond(res);
             return Ok(());
@@ -1451,7 +1522,7 @@ impl Server {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn send_index(
+    async fn send_index(
         &self,
         path: &Path,
         mut paths: Vec<PathItem>,
@@ -1509,7 +1580,8 @@ impl Server {
             "/{}",
             normalize_path(path.strip_prefix(&self.args.serve_path)?)
         );
-        let readwrite = access_paths.perm().readwrite();
+        let readwrite =
+            access_paths.perm().readwrite() && self.path_readwrite(path, user.as_deref()).await;
         let data = IndexData {
             kind: DataKind::Index,
             href,
@@ -1707,21 +1779,36 @@ impl Server {
         entry_path: &Path,
         base_path: &Path,
         access_paths: &AccessPaths,
+        user: Option<&str>,
     ) -> Result<Vec<PathItem>> {
         let mut paths: Vec<PathItem> = vec![];
         let prefix = self.relative_parts(entry_path);
         if access_paths.perm().indexonly() {
             for name in access_paths.child_names() {
                 let entry_path = entry_path.join(name);
-                self.add_pathitem(&mut paths, base_path, &entry_path, access_paths, &prefix)
-                    .await;
+                self.add_pathitem(
+                    &mut paths,
+                    base_path,
+                    &entry_path,
+                    access_paths,
+                    &prefix,
+                    user,
+                )
+                .await;
             }
         } else {
             let mut rd = fs::read_dir(entry_path).await?;
             while let Ok(Some(entry)) = rd.next_entry().await {
                 let entry_path = entry.path();
-                self.add_pathitem(&mut paths, base_path, &entry_path, access_paths, &prefix)
-                    .await;
+                self.add_pathitem(
+                    &mut paths,
+                    base_path,
+                    &entry_path,
+                    access_paths,
+                    &prefix,
+                    user,
+                )
+                .await;
             }
         }
         Ok(paths)
@@ -1734,18 +1821,110 @@ impl Server {
         entry_path: &Path,
         access_paths: &AccessPaths,
         prefix: &[&str],
+        user: Option<&str>,
     ) {
         let base_name = get_file_name(entry_path);
         if let Ok(Some(mut item)) = self.to_pathitem(entry_path, base_path).await {
             if is_hidden(&self.args.hidden, base_name, item.is_dir()) {
                 return;
             }
-            let access = access_paths
-                .entry_access(base_name, prefix, Some(&self.args.serve_path))
-                .await;
+            let Some(access) = self
+                .entry_access(access_paths, entry_path, base_name, prefix, user)
+                .await
+            else {
+                return;
+            };
             self.set_item_access(&mut item, access);
             paths.push(item);
         }
+    }
+
+    /// Resolve the displayed access of an entry from the request path, then
+    /// from its canonical target when the entry is reached through a link.
+    ///
+    /// Returns `None` when the target is not readable, so listings and search
+    /// results hide the same entries.
+    async fn entry_access(
+        &self,
+        access_paths: &AccessPaths,
+        entry_path: &Path,
+        entry_name: &str,
+        prefix: &[&str],
+        user: Option<&str>,
+    ) -> Option<EntryAccess> {
+        let mut access = access_paths
+            .entry_access(entry_name, prefix, Some(&self.args.serve_path))
+            .await;
+        if self.args.auth.has_rules() && self.path_resolves_elsewhere(entry_path).await {
+            // The entry is reached through a link, either as the entry itself
+            // or as a parent component. Check the canonical target so a
+            // listing cannot expose entries the target rule denies.
+            if !self.path_can_access(entry_path, &Method::GET, user).await {
+                return None;
+            }
+            // Display permission follows both the request path and the
+            // canonical target, so write controls are not advertised for
+            // entries that the target rule makes read-only.
+            if access.perm.readwrite() && !self.path_readwrite(entry_path, user).await {
+                access.perm = AccessPerm::ReadOnly;
+            }
+            // Recursive delete follows the target subtree as well, so a
+            // read-only rule below the target blocks it even when the request
+            // path has no such rule. A symlink entry itself can still be
+            // removed, since that only unlinks it.
+            if access.perm.readwrite()
+                && !access.restricted
+                && !self.path_is_symlink(entry_path).await
+                && self
+                    .args
+                    .auth
+                    .target_has_restricted_descendant(
+                        user,
+                        &self.relative_parts(entry_path).join("/"),
+                        &self.args.serve_path,
+                    )
+                    .await
+            {
+                access.restricted = true;
+            }
+        }
+        Some(access)
+    }
+
+    /// Whether `path` does not name its canonical target directly, for example
+    /// because it is a symbolic link or a parent component is one.
+    ///
+    /// Dangling links do not canonicalize and are reported as aliases so the
+    /// authorization check still runs for them.
+    async fn path_resolves_elsewhere(&self, path: &Path) -> bool {
+        match fs::canonicalize(path).await {
+            Ok(canonical) => canonical != path,
+            Err(_) => true,
+        }
+    }
+
+    /// Whether the final component of `path` is a symbolic link. Intermediate
+    /// links are followed, since they make the path name a real target entry.
+    async fn path_is_symlink(&self, path: &Path) -> bool {
+        fs::symlink_metadata(path)
+            .await
+            .map(|meta| meta.file_type().is_symlink())
+            .unwrap_or_default()
+    }
+
+    /// Whether `user` may perform `method` on `path`, accounting for the
+    /// canonical target of any symbolic link on the way.
+    async fn path_can_access(&self, path: &Path, method: &Method, user: Option<&str>) -> bool {
+        let rel_path = self.relative_parts(path).join("/");
+        self.args
+            .auth
+            .can_access(user, &rel_path, method, &self.args.serve_path)
+            .await
+    }
+
+    /// Whether `path` grants write permission, including its canonical target.
+    async fn path_readwrite(&self, path: &Path, user: Option<&str>) -> bool {
+        self.path_can_access(path, &Method::PUT, user).await
     }
 
     async fn to_pathitem<P: AsRef<Path>>(&self, path: P, base_path: P) -> Result<Option<PathItem>> {
@@ -1791,6 +1970,10 @@ impl Server {
             }
             PathType::File | PathType::SymlinkFile => meta.len(),
         };
+        let etag = match path_type {
+            PathType::File | PathType::SymlinkFile => etag_from_metadata(&meta),
+            PathType::Dir | PathType::SymlinkDir => None,
+        };
         let rel_path = path.strip_prefix(base_path)?;
         let name = normalize_path(rel_path);
         Ok(Some(PathItem {
@@ -1798,6 +1981,7 @@ impl Server {
             name,
             mtime,
             size,
+            etag,
             allow_upload: false,
             allow_delete: false,
             readonly_descendant: false,
@@ -1833,6 +2017,7 @@ pub struct PathItem {
     pub name: String,
     pub mtime: u64,
     pub size: u64,
+    pub etag: Option<String>,
     pub allow_upload: bool,
     pub allow_delete: bool,
     pub readonly_descendant: bool,
@@ -1853,6 +2038,11 @@ impl PathItem {
             href.push('/');
         }
         let displayname = escape_str_pcdata(self.base_name());
+        let etag = self
+            .etag
+            .as_deref()
+            .map(|etag| format!("<D:getetag>{}</D:getetag>\n", escape_str_pcdata(etag)))
+            .unwrap_or_default();
         match self.path_type {
             PathType::Dir | PathType::SymlinkDir => format!(
                 r#"<D:response>
@@ -1873,7 +2063,7 @@ impl PathItem {
 <D:propstat>
 <D:prop>
 <D:displayname>{displayname}</D:displayname>
-<D:getcontentlength>{}</D:getcontentlength>
+{etag}<D:getcontentlength>{}</D:getcontentlength>
 <D:getlastmodified>{mtime}</D:getlastmodified>
 <D:resourcetype></D:resourcetype>
 </D:prop>
@@ -1963,6 +2153,32 @@ fn to_timestamp(time: &SystemTime) -> u64 {
         .as_millis() as u64
 }
 
+/// Build an ETag from file metadata without reading the file contents.
+/// Nanosecond mtime and, on Unix, device/inode reduce collisions between files.
+fn etag_from_metadata(meta: &Metadata) -> Option<String> {
+    let mtime = meta.modified().ok()?;
+    let timestamp = mtime
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    let size = meta.len();
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some(format!(
+            r#""{timestamp}-{size}-{:x}-{:x}""#,
+            meta.dev(),
+            meta.ino()
+        ))
+    }
+
+    #[cfg(not(unix))]
+    {
+        Some(format!(r#""{timestamp}-{size}""#))
+    }
+}
+
 fn normalize_path<P: AsRef<Path>>(path: P) -> String {
     let path = path.as_ref().to_str().unwrap_or_default();
     if cfg!(windows) {
@@ -1981,11 +2197,41 @@ async fn ensure_path_parent(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Whether `path` is a symlink, or a directory containing one at any depth.
+///
+/// `MOVE` relocates a link without changing its text, so a relative target can
+/// begin resolving somewhere else after the move. This check lets the caller
+/// refuse such moves when path authorization is enabled.
+async fn contains_symlink(path: &Path) -> bool {
+    match fs::symlink_metadata(path).await {
+        Ok(meta) if meta.is_symlink() => true,
+        Ok(meta) if meta.is_dir() => {
+            let path = path.to_path_buf();
+            tokio::task::spawn_blocking(move || {
+                WalkDir::new(path)
+                    .follow_links(false)
+                    .into_iter()
+                    .any(|entry| match entry {
+                        Ok(entry) => entry.file_type().is_symlink(),
+                        // An unreadable subtree could hide a link; fail closed.
+                        Err(_) => true,
+                    })
+            })
+            .await
+            // Fail closed if the blocking task cannot run.
+            .unwrap_or(true)
+        }
+        _ => false,
+    }
+}
+
 fn add_cors(res: &mut Response) {
+    // A wildcard origin cannot be combined with credentialed requests, so the
+    // credentials header is deliberately omitted. dufs authenticates with
+    // Basic/Digest rather than cookies, and CORS stays as permissive as
+    // possible for every other request.
     res.headers_mut()
         .typed_insert(AccessControlAllowOrigin::ANY);
-    res.headers_mut()
-        .typed_insert(AccessControlAllowCredentials);
     res.headers_mut().insert(
         "Access-Control-Allow-Methods",
         HeaderValue::from_static("*"),
@@ -1996,7 +2242,7 @@ fn add_cors(res: &mut Response) {
     );
     res.headers_mut().insert(
         "Access-Control-Expose-Headers",
-        HeaderValue::from_static("Authorization,X-Dufs-Error-Code,*"),
+        HeaderValue::from_static("*"),
     );
 }
 
@@ -2022,6 +2268,8 @@ async fn zip_dir<W: AsyncWrite + Unpin>(
     compression: CompressionLevel,
     follow_symlinks: bool,
     serve_path: PathBuf,
+    auth: AccessControl,
+    user: Option<String>,
     running: Arc<AtomicBool>,
 ) -> Result<()> {
     let hidden = Arc::new(hidden.to_vec());
@@ -2032,6 +2280,8 @@ async fn zip_dir<W: AsyncWrite + Unpin>(
         hidden,
         follow_symlinks,
         serve_path,
+        auth,
+        user,
         move |x| {
             // Include both files and directories. Symbolic links are already
             // resolved by `follow_links`, so `file_type` reports the target's
@@ -2073,11 +2323,107 @@ async fn zip_dir<W: AsyncWrite + Unpin>(
 
 fn extract_cache_headers(meta: &Metadata) -> Option<(ETag, LastModified)> {
     let mtime = meta.modified().ok().or_else(|| meta.created().ok())?;
-    let timestamp = to_timestamp(&mtime);
-    let size = meta.len();
-    let etag = format!(r#""{timestamp}-{size}""#).parse::<ETag>().ok()?;
+    let etag = etag_from_metadata(meta)?.parse::<ETag>().ok()?;
     let last_modified = LastModified::from(mtime);
     Some((etag, last_modified))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Precondition {
+    Passed,
+    NotModified,
+    Failed,
+}
+
+/// Evaluate the conditional request headers against the current representation.
+///
+/// `allow_not_modified` is true for GET/HEAD, where a matching `If-None-Match`
+/// or an unchanged `If-Modified-Since` produces `304 Not Modified`. For all
+/// other methods it produces `412 Precondition Failed` instead.
+fn evaluate_preconditions(
+    headers: &HeaderMap<HeaderValue>,
+    cache_headers: Option<&(ETag, LastModified)>,
+    allow_not_modified: bool,
+) -> Precondition {
+    let if_match = headers.typed_get::<IfMatch>();
+    if let Some(if_match) = &if_match {
+        match cache_headers {
+            Some((etag, _)) if if_match.precondition_passes(etag) => {}
+            _ => return Precondition::Failed,
+        }
+    }
+
+    // If-Match takes precedence over If-Unmodified-Since.
+    if if_match.is_none() {
+        if let (Some(if_unmodified_since), Some((_, last_modified))) =
+            (headers.typed_get::<IfUnmodifiedSince>(), cache_headers)
+        {
+            if !if_unmodified_since.precondition_passes((*last_modified).into()) {
+                return Precondition::Failed;
+            }
+        }
+    }
+
+    let if_none_match = headers.typed_get::<IfNoneMatch>();
+    if let (Some(if_none_match), Some((etag, _))) = (&if_none_match, cache_headers) {
+        if !if_none_match.precondition_passes(etag) {
+            return if allow_not_modified {
+                Precondition::NotModified
+            } else {
+                Precondition::Failed
+            };
+        }
+    }
+
+    // If-None-Match takes precedence over If-Modified-Since.
+    if if_none_match.is_none() && allow_not_modified {
+        if let (Some(if_modified_since), Some((_, last_modified))) =
+            (headers.typed_get::<IfModifiedSince>(), cache_headers)
+        {
+            if !if_modified_since.is_modified((*last_modified).into()) {
+                return Precondition::NotModified;
+            }
+        }
+    }
+
+    Precondition::Passed
+}
+
+/// Check conditional headers, writing a `304` or `412` response when the
+/// request must stop. Returns whether the request may proceed.
+fn check_preconditions(
+    headers: &HeaderMap<HeaderValue>,
+    cache_headers: Option<&(ETag, LastModified)>,
+    allow_not_modified: bool,
+    res: &mut Response,
+) -> bool {
+    match evaluate_preconditions(headers, cache_headers, allow_not_modified) {
+        Precondition::Passed => true,
+        Precondition::NotModified => {
+            if let Some((etag, _)) = cache_headers {
+                res.headers_mut().typed_insert(etag.clone());
+                res.headers_mut()
+                    .typed_insert(CacheControl::new().with_no_cache());
+            }
+            *res.status_mut() = StatusCode::NOT_MODIFIED;
+            false
+        }
+        Precondition::Failed => {
+            DufsErrorCode::PreconditionFailed.respond(res);
+            false
+        }
+    }
+}
+
+/// Check conditional headers against a target path. Used by the WebDAV
+/// methods, where a failed `If-None-Match` must yield `412`, not `304`.
+fn check_preconditions_for_meta(
+    headers: &HeaderMap<HeaderValue>,
+    meta: Option<&Metadata>,
+    res: &mut Response,
+) -> bool {
+    let cache_headers = meta.and_then(extract_cache_headers);
+    check_preconditions(headers, cache_headers.as_ref(), false, res)
 }
 
 fn status_not_found(res: &mut Response) {
@@ -2210,6 +2556,8 @@ async fn collect_dir_entries<F>(
     hidden: Arc<Vec<String>>,
     follow_symlinks: bool,
     serve_path: PathBuf,
+    auth: AccessControl,
+    user: Option<String>,
     include_entry: F,
 ) -> Vec<PathBuf>
 where
@@ -2252,6 +2600,29 @@ where
                 }
                 continue;
             }
+
+            // Check every entry, not only links: a junction or another
+            // filesystem alias may not report as a symlink, and a link below a
+            // symlinked directory changes the target of paths that are not
+            // links themselves. Without this, an archive or search could read
+            // through the alias and bypass path rules.
+            if auth.has_rules() {
+                let rel_path = entry_path
+                    .strip_prefix(&serve_path)
+                    .ok()
+                    .map(normalize_path)
+                    .unwrap_or_default();
+                if !auth
+                    .can_access(user.as_deref(), &rel_path, &Method::GET, &serve_path)
+                    .await
+                {
+                    if is_dir {
+                        it.skip_current_dir();
+                    }
+                    continue;
+                }
+            }
+
             if !include_entry(&entry) {
                 continue;
             }
